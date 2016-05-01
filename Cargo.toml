@@ -1,0 +1,10 @@
+[package]
+name = "sledge"
+version = "0.1.0"
+authors = ["Joshua Miller <jsmiller@uchicago.edu>"]
+
+[dependencies]
+env_logger = "0.3"
+hyper = "*"
+log = "0.3"
+pbr = "*"
