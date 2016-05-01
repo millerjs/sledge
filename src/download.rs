@@ -83,6 +83,10 @@ fn make_request<H>(url: &str, headers: Vec<H>)
     let client = Client::new();
     let mut request = client.get(url);
 
+    for header in headers {
+        request = request.header(header)
+    }
+
     // Contact API
     info!("Requesting {}", url);
     let mut response = try!(request.send());
