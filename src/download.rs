@@ -7,8 +7,7 @@ use hyper::client::response::Response;
 use hyper::header::ContentDisposition;
 use hyper::header::ContentLength;
 use hyper::header::DispositionParam;
-use hyper::header::Header;
-use hyper::header::HeaderFormat;
+use hyper::header::Headers;
 use hyper::status::StatusCode;
 use pbr::ProgressBar;
 use pbr::Units;
@@ -18,17 +17,35 @@ use std::io;
 use std::path::Path;
 use std::str;
 
+pub enum DownloadMode {
+    Serial,
+    Parallel(u8),
+}
+
+#[allow(dead_code)]
+pub struct Download {
+    /// The url to download from
+    url: String,
+    /// The path to stream the download to
+    output_path: Option<String>,
+    /// Headers to be applied to the request
+    headers: Headers,
+    /// The mode in which this file will de downloaded
+    mode: DownloadMode,
+}
+
 
 /// Download a list of urls
-pub fn download_urls<H>(urls: Vec<String>, headers: Vec<H>)
-                        -> Result<String, DownloadError>
-    where H: Header + HeaderFormat
+pub fn download_urls(urls: Vec<String>, headers: Headers)
+                     -> Result<String, DownloadError>
 {
-    let mut failed = vec![];
+    let mut failed: Vec<String> = vec![];
     let count = urls.len();
 
     for url in urls {
-        match download_to_file(&*url, headers.clone()) {
+        let mut download = Download::new(url.clone());
+        download.headers = headers.clone();
+        match download.to_file() {
             Ok(ok) => info!("{}\n", ok),
             Err(err) => {
                 error!("{}\n", err);
@@ -43,61 +60,6 @@ pub fn download_urls<H>(urls: Vec<String>, headers: Vec<H>)
                     count - failed.len(), failed.join(", "))))
     } else {
         Ok(format!("All {} files downloaded successfully", count))
-    }
-}
-
-
-/// Serially download file to file
-pub fn download_to_file<H>(url: &str, headers: Vec<H>)
-                           -> Result<String, DownloadError>
-    where H: Header + HeaderFormat
-{
-    let request = try!(make_request(url, headers));
-
-    match stream_response_to_file(request) {
-        Ok(ok) => Ok(format!("Download complete: {}", ok)),
-        Err(err) => Err(DownloadError(format!("Unable to download {}: {}", url, err))),
-    }
-}
-
-
-/// Stream a successful response to a file
-fn stream_response_to_file(mut response: Response)
-                           -> Result<String, DownloadError>
-{
-    let file_size = try!(parse_file_size(&response));
-    let mut file = try!(open_file_for_response(&response));
-
-    match copy_with_progress(file_size, &mut response, &mut file) {
-        Ok(bytes) => Ok(format!("Wrote {} bytes", bytes)),
-        Err(err) => Err(DownloadError(format!("{}", err)))
-    }
-}
-
-
-fn make_request<H>(url: &str, headers: Vec<H>)
-                   -> Result<Response, DownloadError>
-    where H: Header + HeaderFormat
-{
-    // Construct a request
-    let client = Client::new();
-    let mut request = client.get(url);
-
-    for header in headers {
-        request = request.header(header)
-    }
-
-    // Contact API
-    info!("Requesting {}", url);
-    let mut response = try!(request.send());
-
-    if response.status != StatusCode::Ok {
-        let mut body = String::new();
-        try!(response.read_to_string(&mut body));
-        Err(DownloadError(format!("{:}: {}", response.status, body)))
-    } else {
-        debug!("Request to {} successful", url);
-        Ok(response)
     }
 }
 
@@ -129,62 +91,118 @@ pub fn copy_with_progress<R: ?Sized, W: ?Sized>(stream_size: u64, reader: &mut R
 }
 
 
-/// Reads the filename from the Content-Disposition if possible
-fn parse_file_name(response: &Response) -> Result<String, DownloadError>
-{
-    if let Some(disposition) = response.headers.get::<ContentDisposition>() {
-        let file_name_param = disposition.parameters.iter()
-            .map(|p| match *p {
-                DispositionParam::Filename(_, _, ref bytes) => {
-                    match str::from_utf8(bytes) {
-                        Err(e) => { warn!("{}", e); None },
-                        Ok(s) => Some(s),
-                    }
-                },
-                _ => None
-            }).filter_map(|p| p).nth(0);
+impl Download {
 
-        if let Some(file_name) = file_name_param {
-            debug!("server provided filename: {}", file_name);
-            return Ok(file_name.to_string())
+    pub fn new(url: String) -> Download {
+        Download {
+            url: url,
+            headers: Headers::new(),
+            output_path: None,
+            mode: DownloadMode::Serial,
         }
     }
 
-    Err(DownloadError(format!("server url not provide a filename")))
-}
-
-
-/// Reads the file size from the Content-Length if possible
-fn parse_file_size(response: &Response) -> Result<u64, DownloadError>
-{
-    match response.headers.get::<ContentLength>() {
-        Some(size) => Ok(size.0),
-        None => Err(DownloadError(
-            "Server did not provide a content length!".to_owned())),
-    }
-}
-
-
-/// Parse the file name (or use default name) and return an opened file
-fn open_file_for_response(response: &Response)
-                          -> Result<File, DownloadError>
-{
-    let file_name = match parse_file_name(&response) {
-        Ok(name) => name,
-        Err(e) => {
-            let default = response.url.path_segments()
-                .unwrap().collect::<Vec<_>>().last().unwrap().to_string();
-            warn!("No filename ({}) downloading to {}", e, default);
-            default
+    /// Serially download file to file
+    pub fn to_file(&mut self) -> Result<String, DownloadError>
+    {
+        let request = try!(self.make_request());
+        match self.stream_response_to_file(request) {
+            Ok(ok) => Ok(format!("Download complete: {}", ok)),
+            Err(err) => Err(DownloadError(format!("Unable to download {}: {}", self.url, err))),
         }
-    };
-
-    let path = Path::new(&*file_name).file_name().unwrap();
-    info!("Streaming data to {}", file_name);
-
-    match File::create(path) {
-        Ok(f) => Ok(f),
-        Err(e) => Err(DownloadError(
-            format!("Unable to open file {} for writing: {}", file_name, e))),
     }
+
+    /// Construct and execute request against API to stream data
+    fn make_request(&mut self) -> Result<Response, DownloadError>
+    {
+        let client = Client::new();
+        let request = client.get(&*self.url).headers(self.headers.clone());
+
+        // Contact API
+        info!("Requesting {}", self.url);
+        let mut response = try!(request.send());
+
+        // Handle response
+        if response.status != StatusCode::Ok {
+            let mut body = String::new();
+            try!(response.read_to_string(&mut body));
+            Err(DownloadError(format!("{:}: {}", response.status, body)))
+        } else {
+            debug!("Request to {} successful", self.url);
+            Ok(response)
+        }
+    }
+
+    /// Stream a successful response to a file
+    fn stream_response_to_file(&mut self, mut response: Response) -> Result<String, DownloadError>
+    {
+        let file_size = try!(self.parse_file_size(&response));
+        let mut file = try!(self.open_file_for_response(&response));
+
+        match copy_with_progress(file_size, &mut response, &mut file) {
+            Ok(bytes) => Ok(format!("Wrote {} bytes", bytes)),
+            Err(err) => Err(DownloadError(format!("{}", err)))
+        }
+    }
+
+
+    /// Reads the filename from the Content-Disposition if possible
+    fn parse_file_name(&mut self, response: &Response) -> Result<String, DownloadError>
+    {
+        if let Some(disposition) = response.headers.get::<ContentDisposition>() {
+            let file_name_param = disposition.parameters.iter()
+                .map(|p| match *p {
+                    DispositionParam::Filename(_, _, ref bytes) => {
+                        match str::from_utf8(bytes) {
+                            Err(e) => { warn!("{}", e); None },
+                            Ok(s) => Some(s),
+                        }
+                    },
+                    _ => None
+                }).filter_map(|p| p).nth(0);
+
+            if let Some(file_name) = file_name_param {
+                debug!("server provided filename: {}", file_name);
+                return Ok(file_name.to_string())
+            }
+        }
+
+        Err(DownloadError(format!("server url not provide a filename")))
+    }
+
+
+    /// Reads the file size from the Content-Length if possible
+    fn parse_file_size(&mut self, response: &Response) -> Result<u64, DownloadError>
+    {
+        match response.headers.get::<ContentLength>() {
+            Some(size) => Ok(size.0),
+            None => Err(DownloadError(
+                "Server did not provide a content length!".to_owned())),
+        }
+    }
+
+
+    /// Parse the file name (or use default name) and return an opened file
+    fn open_file_for_response(&mut self, response: &Response) -> Result<File, DownloadError>
+    {
+        let file_name = match self.parse_file_name(&response) {
+            Ok(name) => name,
+            Err(e) => {
+                let default = response.url.path_segments()
+                    .unwrap().collect::<Vec<_>>().last().unwrap().to_string();
+                warn!("No filename ({}) downloading to {}", e, default);
+                default
+            }
+        };
+
+        let path = Path::new(&*file_name).file_name().unwrap();
+        info!("Streaming data to {}", file_name);
+
+        match File::create(path) {
+            Ok(f) => Ok(f),
+            Err(e) => Err(DownloadError(
+                format!("Unable to open file {} for writing: {}", file_name, e))),
+        }
+    }
+
 }
