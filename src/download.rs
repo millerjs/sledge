@@ -1,6 +1,5 @@
 //! Download files
 
-
 use ::DEFAULT_BUFF_SIZE;
 use ::errors::DownloadError;
 use hyper::Client;
@@ -12,12 +11,15 @@ use hyper::header::Headers;
 use hyper::status::StatusCode;
 use pbr::ProgressBar;
 use pbr::Units;
+use std::cmp::min;
 use std::fs::File;
+use std::io::prelude::Seek;
 use std::io::Read;
 use std::io::Write;
 use std::io;
 use std::path::Path;
 use std::str;
+use std::thread;
 
 
 #[derive(Clone)]
@@ -39,7 +41,6 @@ pub enum DownloadMode {
     Parallel(u8),
 }
 
-#[allow(dead_code)]
 pub struct Download {
     /// The url to download from
     url: String,
@@ -50,7 +51,6 @@ pub struct Download {
     /// The mode in which this file will de downloaded
     mode: DownloadMode,
 }
-
 
 impl Download {
 
@@ -78,94 +78,154 @@ impl Download {
         self
     }
 
-    /// Construct and execute request against API to stream data to
-    /// the Download target
-    fn make_request(&mut self) -> Result<Response, DownloadError>
+    /// Set the mode of the Download
+    pub fn mode(mut self, mode: DownloadMode) -> Download
     {
-        let client = Client::new();
-        let request = client.get(&*self.url).headers(self.headers.clone());
+        self.mode = mode;
+        self
+    }
 
-        // Contact API
-        info!("Requesting {}", self.url);
-        let mut response = try!(request.send());
-
-        // Handle response
-        if response.status != StatusCode::Ok {
-            let mut body = String::new();
-            try!(response.read_to_string(&mut body));
-            Err(DownloadError(format!("{:}: {}", response.status, body)))
-        } else {
-            debug!("Request to {} successful", self.url);
-            Ok(response)
+    /// Download the source to target base on the download mode
+    pub fn download(&mut self) -> Result<u64, DownloadError>
+    {
+        match self.mode {
+            DownloadMode::Serial => self.download_serial(),
+            DownloadMode::Parallel(n) => self.download_parallel(n),
         }
     }
 
-    /// Stream a successful response to a file
-    fn stream(&mut self) -> Result<u64, DownloadError>
+    /// Download the source to the target serially
+    fn download_serial(&mut self) -> Result<u64, DownloadError>
     {
-        let mut response = try!(self.make_request());
-        let file_size = try!(parse_file_size(&response));
+        info!("Downloading serially");
+        let response  = try!(get(&*self.url, self.headers.clone()));
+        let size = try!(parse_content_length(&response));
+        try!(set_target_len(&self.target, size, &response));
+        stream(&self.target, 0, response)
+    }
 
-        Ok(match self.target {
-            DownloadTarget::Default => {
-                let mut file = try!(open_default_file_target(&response));
-                try!(copy_with_progress(file_size, &mut response, &mut file))
-            },
-            DownloadTarget::File(ref path) => {
-                let mut file = try!(File::open(path));
-                try!(copy_with_progress(file_size, &mut response, &mut file))
-            },
-            DownloadTarget::StdOut => {
-                try!(copy_with_progress(file_size, &mut response, &mut io::stdout()))
-            }
-        })
+    /// Download the source to the target in parallel
+    fn download_parallel(&mut self, n: u8) -> Result<u64, DownloadError>
+    {
+        info!("Downloading with {} threads", n);
+
+        let head = try!(head(&*self.url, self.headers.clone()));
+        let size = try!(parse_content_length(&head));
+        let block_size = size / (n as u64);
+
+        try!(set_target_len(&self.target, size, &head));
+
+        let mut children = vec![];
+        for i in 0..n {
+            let headers = self.headers.clone();
+            let target = self.target.clone();
+            let url = self.url.clone();
+
+            let start = min(i as u64 * block_size, size);
+            let end = min((i as u64 + 1) * block_size, size);
+
+            children.push(thread::spawn(move || {
+                debug!("Making request for segment ({} - {})", start, end);
+                let response = try!(get(&*url, headers));
+                stream(&target, start, response)
+            }))
+        };
+
+        debug!("Joining.");
+
+        for child in children {
+            let _ = child.join();
+        }
+
+        Ok(size)
     }
 }
 
-
-/// Download a list of urls
-pub fn download_urls(urls: Vec<String>, target: DownloadTarget, headers: Headers)
-                     -> Result<String, DownloadError>
+/// Construct and execute GET request against API
+fn get(url: &str, headers: Headers) -> Result<Response, DownloadError>
 {
-    let mut failed: Vec<String> = vec![];
-    let count = urls.len();
+    let client = Client::new();
+    let request = client.get(&*url).headers(headers);
+    raise_for_status(try!(request.send()))
+}
 
-    for url in urls {
+/// Construct and execute HEAD request against API
+fn head(url: &str, headers: Headers) -> Result<Response, DownloadError>
+{
+    let client = Client::new();
+    let request = client.head(url).headers(headers);
+    raise_for_status(try!(request.send()))
+}
 
-        let mut download = Download::new(url.clone())
-            .headers(headers.clone())
-            .target(target.clone());
+/// Returns error if request unsuccessful
+fn raise_for_status(mut response: Response) -> Result<Response, DownloadError>
+{
+    if response.status != StatusCode::Ok {
+        let mut body = String::new();
+        try!(response.read_to_string(&mut body));
+        Err(DownloadError(format!("{:}: {}", response.status, body)))
+    } else {
+        debug!("Request to {} successful", response.url);
+        Ok(response)
+    }
+}
 
-        match download.stream() {
-            Err(err) => {
-                error!("Unable to download {}: {}\n", url, err);
-                failed.push(url);
-            },
-            Ok(bytes) => info!("Download complete. Wrote {} bytes.\n", bytes),
+/// Set the expected length of the target (if applicable)
+fn set_target_len(target: &DownloadTarget, size: u64, response: &Response)
+                  -> Result<(), DownloadError>
+{
+    info!("Setting the length of target to {} bytes", size);
+    match *target {
+        DownloadTarget::Default => {
+            let file = try!(open_default_file_target(response));
+            Ok(try!(file.set_len(size)))
+        },
+        DownloadTarget::File(ref path) => {
+            let file = try!(File::open(path));
+            Ok(try!(file.set_len(size)))
+        },
+        DownloadTarget::StdOut => {
+            Err(DownloadError("Cannot take offset on stdout".to_owned()))
         }
     }
+}
 
-    if failed.len() > 0 {
-        Err(DownloadError(format!(
-            "Downloaded {} files successfully. Failed to download {}",
-            count - failed.len(), failed.join(", "))))
-
-    } else {
-        Ok(format!("All {} files downloaded successfully", count))
-    }
+/// Stream the response to the download target at a given offset (if applicable)
+fn stream(target: &DownloadTarget, offset: u64, mut response: Response)
+          -> Result<u64, DownloadError>
+{
+    let size = try!(parse_content_length(&response));
+    Ok(match *target {
+        DownloadTarget::Default => {
+            let mut file = try!(open_default_file_target(&response));
+            try!(file.seek(io::SeekFrom::Start(offset)));
+            try!(io::copy(&mut response, &mut file))
+        },
+        DownloadTarget::File(ref path) => {
+            let mut file = try!(File::open(path));
+            try!(file.seek(io::SeekFrom::Start(offset)));
+            try!(io::copy(&mut response, &mut file))
+        },
+        DownloadTarget::StdOut => {
+            try!(copy(size, &mut response, &mut io::stdout()))
+        }
+    })
 }
 
 
 /// Vendored io::copy() to report progress because <Write>.broadcast() was
 /// deprecated in 1.6
-pub fn copy_with_progress<R: ?Sized, W: ?Sized>(stream_size: u64, reader: &mut R, writer: &mut W)
-                                                -> io::Result<u64>
+pub fn copy<R: ?Sized, W: ?Sized>(
+    size: u64,
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<u64>
     where R: io::Read, W: io::Write
 {
-    debug!("Stream is {} bytes", stream_size);
+    debug!("Stream is {} bytes", size);
 
     let mut buf = [0; DEFAULT_BUFF_SIZE];
-    let mut pb = ProgressBar::new(stream_size);
+    let mut pb = ProgressBar::new(size);
     let mut written = 0;
 
     pb.set_units(Units::Bytes);
@@ -185,7 +245,7 @@ pub fn copy_with_progress<R: ?Sized, W: ?Sized>(stream_size: u64, reader: &mut R
 
 
 /// Reads the file size from the Content-Length if possible
-fn parse_file_size(response: &Response) -> Result<u64, DownloadError>
+fn parse_content_length(response: &Response) -> Result<u64, DownloadError>
 {
     match response.headers.get::<ContentLength>() {
         Some(size) => Ok(size.0),
@@ -202,13 +262,13 @@ fn open_default_file_target(response: &Response) -> Result<File, DownloadError>
         Err(e) => {
             let default = response.url.path_segments()
                 .unwrap().collect::<Vec<_>>().last().unwrap().to_string();
-            warn!("no filename ({}) downloading to {}", e, default);
+            debug!("no filename ({}) downloading to {}", e, default);
             default
         }
     };
 
     let path = Path::new(&*file_name).file_name().unwrap();
-    info!("opening {} to stream data", file_name);
+    debug!("opening {}", file_name);
 
     match File::create(path) {
         Ok(f) => Ok(f),
