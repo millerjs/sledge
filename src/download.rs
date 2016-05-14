@@ -4,23 +4,42 @@ use ::DEFAULT_BUFF_SIZE;
 use ::errors::DownloadError;
 use hyper::Client;
 use hyper::client::response::Response;
-use hyper::header::ContentDisposition;
-use hyper::header::ContentLength;
-use hyper::header::DispositionParam;
-use hyper::header::Headers;
 use hyper::status::StatusCode;
 use std::cmp::min;
 use std::fs::File;
 use std::io::prelude::Seek;
-use std::io::Read;
-use std::io::Write;
-use std::io;
 use std::path::Path;
-use std::str;
-use std::sync::mpsc::{Sender, Receiver, channel};
-use std::thread;
 
-use reporter::{Reporter, CompletedSegment};
+use std::{
+    io,
+    str,
+    thread,
+};
+
+use hyper::header::{
+    ByteRangeSpec,
+    ContentDisposition,
+    ContentLength,
+    DispositionParam,
+    Headers,
+    Range,
+};
+
+use reporter::{
+    CompletedSegment,
+    Reporter,
+};
+
+use std::sync::mpsc::{
+    Sender,
+    channel,
+};
+
+use std::io::{
+    Read,
+    Write,
+};
+
 
 #[derive(Clone)]
 pub enum DownloadTarget {
@@ -134,17 +153,19 @@ impl<R> Download<R>
 
         let (tx, rx) = channel();
         for i in 0..n {
-            let headers = self.headers.clone();
+            let mut headers = self.headers.clone();
             let target = self.target.clone();
             let url = self.url.clone();
             let reporter = tx.clone();
 
             let start = min(i as u64 * block_size, size);
             let end = min((i as u64 + 1) * block_size, size);
+            headers.set(Range::Bytes(vec![ByteRangeSpec::FromTo(start, end)]));
 
             children.push(thread::spawn(move || {
                 debug!("Making request for segment ({} - {})", start, end);
                 let response = try!(get(&*url, headers));
+                debug!("returned");
                 stream(&target, start, response, reporter)
             }))
         };
@@ -162,6 +183,7 @@ impl<R> Download<R>
 /// Construct and execute GET request against API
 fn get(url: &str, headers: Headers) -> Result<Response, DownloadError>
 {
+    debug!("GET: {}", url);
     let client = Client::new();
     let request = client.get(&*url).headers(headers);
     raise_for_status(try!(request.send()))
@@ -170,6 +192,7 @@ fn get(url: &str, headers: Headers) -> Result<Response, DownloadError>
 /// Construct and execute HEAD request against API
 fn head(url: &str, headers: Headers) -> Result<Response, DownloadError>
 {
+    debug!("HEAD: {}", url);
     let client = Client::new();
     let request = client.head(url).headers(headers);
     raise_for_status(try!(request.send()))
@@ -221,15 +244,15 @@ fn stream(
         DownloadTarget::Default => {
             let mut file = try!(open_default_file_target(&response));
             try!(file.seek(io::SeekFrom::Start(offset)));
-            try!(copy_with_report(size, &mut response, &mut file, reporter))
+            try!(copy_with_reporter(size, &mut response, &mut file, reporter))
         },
         DownloadTarget::File(ref path) => {
             let mut file = try!(File::open(path));
             try!(file.seek(io::SeekFrom::Start(offset)));
-            try!(copy_with_report(size, &mut response, &mut file, reporter))
+            try!(copy_with_reporter(size, &mut response, &mut file, reporter))
         },
         DownloadTarget::StdOut => {
-            try!(copy_with_report(size, &mut response, &mut io::stdout(), reporter))
+            try!(copy_with_reporter(size, &mut response, &mut io::stdout(), reporter))
         }
     })
 }
@@ -237,7 +260,7 @@ fn stream(
 
 /// Vendored io::copy() to report progress because <Write>.broadcast() was
 /// deprecated in 1.6
-pub fn copy_with_report<R: ?Sized, W: ?Sized>(
+pub fn copy_with_reporter<R: ?Sized, W: ?Sized>(
     size: u64,
     reader: &mut R,
     writer: &mut W,
@@ -257,8 +280,10 @@ pub fn copy_with_report<R: ?Sized, W: ?Sized>(
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         } as u64;
+
         try!(writer.write_all(&buf[..len as usize]));
         written += len;
+
         reporter.send(CompletedSegment {
             start: written,
             len: len,
@@ -275,7 +300,6 @@ fn parse_content_length(response: &Response) -> Result<u64, DownloadError>
         None => Err(DownloadError(format!("server did not provide a content length!"))),
     }
 }
-
 
 /// Parse the file name (or use default name) and return an opened file
 fn open_default_file_target(response: &Response) -> Result<File, DownloadError>
