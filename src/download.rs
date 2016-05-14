@@ -9,8 +9,6 @@ use hyper::header::ContentLength;
 use hyper::header::DispositionParam;
 use hyper::header::Headers;
 use hyper::status::StatusCode;
-use pbr::ProgressBar;
-use pbr::Units;
 use std::cmp::min;
 use std::fs::File;
 use std::io::prelude::Seek;
@@ -19,8 +17,10 @@ use std::io::Write;
 use std::io;
 use std::path::Path;
 use std::str;
+use std::sync::mpsc::{Sender, Receiver, channel};
 use std::thread;
 
+use reporter::{Reporter, CompletedSegment};
 
 #[derive(Clone)]
 pub enum DownloadTarget {
@@ -41,7 +41,9 @@ pub enum DownloadMode {
     Parallel(u8),
 }
 
-pub struct Download {
+pub struct Download<R>
+    where R: Reporter
+{
     /// The url to download from
     url: String,
     /// The path to stream the download to
@@ -50,36 +52,41 @@ pub struct Download {
     headers: Headers,
     /// The mode in which this file will de downloaded
     mode: DownloadMode,
+    /// Reporter for reporting download progress
+    reporter: R,
 }
 
-impl Download {
+impl<R> Download<R>
+    where R: Reporter
+{
 
     /// Create a new Download
-    pub fn new(url: String) -> Download {
+    pub fn new(url: String) -> Download<R> {
         Download {
             headers: Headers::new(),
             mode: DownloadMode::Serial,
             url: url,
             target: DownloadTarget::Default,
+            reporter: R::new(),
         }
     }
 
     /// Set the headers of the Download
-    pub fn headers(mut self, headers: Headers) -> Download
+    pub fn headers(mut self, headers: Headers) -> Download<R>
     {
         self.headers = headers;
         self
     }
 
     /// Set the target of the Download
-    pub fn target(mut self, target: DownloadTarget) -> Download
+    pub fn target(mut self, target: DownloadTarget) -> Download<R>
     {
         self.target = target;
         self
     }
 
     /// Set the mode of the Download
-    pub fn mode(mut self, mode: DownloadMode) -> Download
+    pub fn mode(mut self, mode: DownloadMode) -> Download<R>
     {
         self.mode = mode;
         self
@@ -101,7 +108,16 @@ impl Download {
         let response  = try!(get(&*self.url, self.headers.clone()));
         let size = try!(parse_content_length(&response));
         try!(set_target_len(&self.target, size, &response));
-        stream(&self.target, 0, response)
+
+        let (tx, rx) = channel();
+        let target = self.target.clone();
+
+        let downloader = thread::spawn(move|| {
+            stream(&target, 0, response, tx)
+        });
+
+        self.reporter.listen(size, rx);
+        downloader.join().unwrap()
     }
 
     /// Download the source to the target in parallel
@@ -112,14 +128,16 @@ impl Download {
         let head = try!(head(&*self.url, self.headers.clone()));
         let size = try!(parse_content_length(&head));
         let block_size = size / (n as u64);
+        let mut children = vec![];
 
         try!(set_target_len(&self.target, size, &head));
 
-        let mut children = vec![];
+        let (tx, rx) = channel();
         for i in 0..n {
             let headers = self.headers.clone();
             let target = self.target.clone();
             let url = self.url.clone();
+            let reporter = tx.clone();
 
             let start = min(i as u64 * block_size, size);
             let end = min((i as u64 + 1) * block_size, size);
@@ -127,11 +145,11 @@ impl Download {
             children.push(thread::spawn(move || {
                 debug!("Making request for segment ({} - {})", start, end);
                 let response = try!(get(&*url, headers));
-                stream(&target, start, response)
+                stream(&target, start, response, reporter)
             }))
         };
 
-        debug!("Joining.");
+        self.reporter.listen(size, rx);
 
         for child in children {
             let _ = child.join();
@@ -191,23 +209,27 @@ fn set_target_len(target: &DownloadTarget, size: u64, response: &Response)
 }
 
 /// Stream the response to the download target at a given offset (if applicable)
-fn stream(target: &DownloadTarget, offset: u64, mut response: Response)
-          -> Result<u64, DownloadError>
+fn stream(
+    target: &DownloadTarget,
+    offset: u64,
+    mut response: Response,
+    reporter: Sender<CompletedSegment>
+) -> Result<u64, DownloadError>
 {
     let size = try!(parse_content_length(&response));
     Ok(match *target {
         DownloadTarget::Default => {
             let mut file = try!(open_default_file_target(&response));
             try!(file.seek(io::SeekFrom::Start(offset)));
-            try!(io::copy(&mut response, &mut file))
+            try!(copy_with_report(size, &mut response, &mut file, reporter))
         },
         DownloadTarget::File(ref path) => {
             let mut file = try!(File::open(path));
             try!(file.seek(io::SeekFrom::Start(offset)));
-            try!(io::copy(&mut response, &mut file))
+            try!(copy_with_report(size, &mut response, &mut file, reporter))
         },
         DownloadTarget::StdOut => {
-            try!(copy(size, &mut response, &mut io::stdout()))
+            try!(copy_with_report(size, &mut response, &mut io::stdout(), reporter))
         }
     })
 }
@@ -215,20 +237,18 @@ fn stream(target: &DownloadTarget, offset: u64, mut response: Response)
 
 /// Vendored io::copy() to report progress because <Write>.broadcast() was
 /// deprecated in 1.6
-pub fn copy<R: ?Sized, W: ?Sized>(
+pub fn copy_with_report<R: ?Sized, W: ?Sized>(
     size: u64,
     reader: &mut R,
     writer: &mut W,
+    reporter: Sender<CompletedSegment>,
 ) -> io::Result<u64>
     where R: io::Read, W: io::Write
 {
     debug!("Stream is {} bytes", size);
 
     let mut buf = [0; DEFAULT_BUFF_SIZE];
-    let mut pb = ProgressBar::new(size);
     let mut written = 0;
-
-    pb.set_units(Units::Bytes);
 
     loop {
         let len = match reader.read(&mut buf) {
@@ -236,13 +256,16 @@ pub fn copy<R: ?Sized, W: ?Sized>(
             Ok(len) => len,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
-        };
-        try!(writer.write_all(&buf[..len]));
-        written += len as u64;
-        pb.add(len as u64);
+        } as u64;
+        try!(writer.write_all(&buf[..len as usize]));
+        written += len;
+        reporter.send(CompletedSegment {
+            start: written,
+            len: len,
+            md5: "".to_string(),
+        });
     }
 }
-
 
 /// Reads the file size from the Content-Length if possible
 fn parse_content_length(response: &Response) -> Result<u64, DownloadError>
