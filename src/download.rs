@@ -275,7 +275,7 @@ pub fn copy_with_reporter<R: ?Sized, W: ?Sized>(
 {
     debug!("Stream is {} bytes", size);
 
-    let mut buf = [0; DEFAULT_BUFF_SIZE];
+    let mut buf = vec![0; DEFAULT_BUFF_SIZE];
     let mut written = 0;
 
     loop {
