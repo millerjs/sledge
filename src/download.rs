@@ -41,7 +41,7 @@ use std::io::{
 };
 
 
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub enum DownloadTarget {
     /// Download the file to a given path
     File(String),
@@ -126,7 +126,10 @@ impl<R> Download<R>
         info!("Downloading serially");
         let response  = try!(get(&*self.url, self.headers.clone()));
         let size = try!(parse_content_length(&response));
-        try!(set_target_len(&self.target, size, &response));
+
+        match set_target_len(&self.target, size, &response) {
+            Err(e) => warn!("{}", e), Ok(_) => ()
+        };
 
         let (tx, rx) = channel();
         let target = self.target.clone();
@@ -149,7 +152,9 @@ impl<R> Download<R>
         let block_size = size / (n as u64);
         let mut children = vec![];
 
-        try!(set_target_len(&self.target, size, &head));
+        match set_target_len(&self.target, size, &head) {
+            Err(e) => warn!("{}", e), Ok(_) => ()
+        };
 
         let (tx, rx) = channel();
         for i in 0..n {
@@ -173,7 +178,7 @@ impl<R> Download<R>
         self.reporter.listen(size, rx);
 
         for child in children {
-            let _ = child.join();
+            println!("{:?}", child.join());
         }
 
         Ok(size)
@@ -215,7 +220,7 @@ fn raise_for_status(mut response: Response) -> Result<Response, DownloadError>
 fn set_target_len(target: &DownloadTarget, size: u64, response: &Response)
                   -> Result<(), DownloadError>
 {
-    info!("Setting the length of target to {} bytes", size);
+    info!("Setting the length of target {:?} to {} bytes", target, size);
     match *target {
         DownloadTarget::Default => {
             let file = try!(open_default_file_target(response));
@@ -270,7 +275,7 @@ pub fn copy_with_reporter<R: ?Sized, W: ?Sized>(
 {
     debug!("Stream is {} bytes", size);
 
-    let mut buf = [0; DEFAULT_BUFF_SIZE];
+    let mut buf = vec![0; DEFAULT_BUFF_SIZE];
     let mut written = 0;
 
     loop {
@@ -284,7 +289,7 @@ pub fn copy_with_reporter<R: ?Sized, W: ?Sized>(
         try!(writer.write_all(&buf[..len as usize]));
         written += len;
 
-        reporter.send(CompletedSegment {
+        let _ = reporter.send(CompletedSegment {
             start: written,
             len: len,
             md5: "".to_string(),
